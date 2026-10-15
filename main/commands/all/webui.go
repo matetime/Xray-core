@@ -32,18 +32,20 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/infra/conf/serial"
 	"github.com/xtls/xray-core/main/commands/base"
+	"golang.org/x/crypto/acme/autocert"
 	"golang.org/x/crypto/curve25519"
 )
 
 var cmdWebUI = &base.Command{
-	UsageLine: "{{.Exec}} webui [-listen 0.0.0.0:8080] [-token password]",
-	Short:     "Start modern HTTPS Web UI for VLESS + (RAW / XHTTP / gRPC) + REALITY",
+	UsageLine: "{{.Exec}} webui [-listen 0.0.0.0:8080] [-token password] [-domain auto]",
+	Short:     "Start compact HTTPS Web UI for VLESS + (RAW / XHTTP / gRPC) + REALITY",
 	Long: `
-Start an embedded HTTPS Web UI to configure and run a VLESS + REALITY node.
+Start an embedded HTTPS Web UI with automatic Let's Encrypt SSL certificate.
 
 Arguments:
-	-listen <addr:port> : Address and port for the Web UI (default: 127.0.0.1:8080)
+	-listen <addr:port> : Address and port for the Web UI (default: 0.0.0.0:8080)
 	-token <string>     : Password for Web UI login (default: admin)
+	-domain <string>    : Domain for Let's Encrypt SSL (default: auto via sslip.io)
 	-state <file>       : Path to state file (default: webui_state.json)
 `,
 }
@@ -51,12 +53,12 @@ Arguments:
 var (
 	uiListen  string
 	uiToken   string
+	uiDomain  string
 	stateFile string
 
 	instanceMu   sync.Mutex
 	xrayInstance *core.Instance
 	currentState NodeState
-	caCertPEM    []byte
 )
 
 type NodeState struct {
@@ -80,8 +82,9 @@ type NodeState struct {
 
 func init() {
 	cmdWebUI.Run = executeWebUI
-	_ = cmdWebUI.Flag.String("listen", "127.0.0.1:8080", "Web UI listen address")
+	_ = cmdWebUI.Flag.String("listen", "0.0.0.0:8080", "Web UI listen address")
 	_ = cmdWebUI.Flag.String("token", "admin", "Password for Web UI login")
+	_ = cmdWebUI.Flag.String("domain", "", "Custom domain for Let's Encrypt (empty = auto sslip.io)")
 	_ = cmdWebUI.Flag.String("state", "webui_state.json", "State file path")
 
 	base.RootCommand.Commands = append(base.RootCommand.Commands, cmdWebUI)
@@ -91,18 +94,18 @@ func executeWebUI(cmd *base.Command, args []string) {
 	cmd.Flag.Parse(args)
 	uiListen = cmd.Flag.Lookup("listen").Value.String()
 	uiToken = cmd.Flag.Lookup("token").Value.String()
+	uiDomain = cmd.Flag.Lookup("domain").Value.String()
 	stateFile = cmd.Flag.Lookup("state").Value.String()
 
 	initDefaultState()
 
-	tlsCert, err := ensureTLSCert(currentState.ServerHost)
-	if err != nil {
-		log.Fatalf("[Xray-WebUI] TLS certificate error: %v", err)
+	outIP := detectOutboundIP()
+	if uiDomain == "" && outIP != "127.0.0.1" {
+		uiDomain = strings.ReplaceAll(outIP, ".", "-") + ".sslip.io"
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handleIndex)
-	mux.HandleFunc("/ca.crt", handleCACert)
 	mux.HandleFunc("/api/login", handleLogin)
 	mux.HandleFunc("/api/state", authMiddleware(handleState))
 	mux.HandleFunc("/api/apply", authMiddleware(handleApply))
@@ -110,15 +113,21 @@ func executeWebUI(cmd *base.Command, args []string) {
 	mux.HandleFunc("/api/update/check", authMiddleware(handleUpdateCheck))
 	mux.HandleFunc("/api/update/run", authMiddleware(handleUpdateRun))
 
-	log.Printf("[Xray-WebUI] Secured HTTPS UI listening on https://%s (Xray Core v%s)", uiListen, core.Version())
 	if currentState.ServerHost != "" {
 		if err := restartXrayInstance(); err != nil {
 			log.Printf("[Xray-WebUI] Autostart deferred: %v", err)
 		}
 	}
 
+	_, portStr, err := net.SplitHostPort(uiListen)
+	if err != nil {
+		portStr = "8080"
+	}
+
+	log.Printf("[Xray-WebUI] Trusted HTTPS URL: https://%s:%s", uiDomain, portStr)
+
 	go func() {
-		if err := serveHTTPAndHTTPS(uiListen, tlsCert, mux); err != nil {
+		if err := serveAutoHTTPS(uiListen, uiDomain, portStr, mux); err != nil {
 			log.Fatalf("[Xray-WebUI] Server error: %v", err)
 		}
 	}()
@@ -134,7 +143,6 @@ func executeWebUI(cmd *base.Command, args []string) {
 	instanceMu.Unlock()
 }
 
-// Multiplexes both HTTP (auto-redirecting to HTTPS) and HTTPS on the same port
 type peekConn struct {
 	net.Conn
 	r *bufio.Reader
@@ -159,7 +167,29 @@ func (l *chanListener) Accept() (net.Conn, error) {
 func (l *chanListener) Close() error   { return nil }
 func (l *chanListener) Addr() net.Addr { return l.addr }
 
-func serveHTTPAndHTTPS(addr string, cert tls.Certificate, handler http.Handler) error {
+func serveAutoHTTPS(addr, autoDomain, portStr string, handler http.Handler) error {
+	fallbackCert, _ := generateSelfSignedCert(currentState.ServerHost)
+
+	certManager := &autocert.Manager{
+		Prompt: autocert.AcceptTOS,
+		Cache:  autocert.DirCache("webui_certs"),
+		HostPolicy: func(ctx context.Context, host string) error {
+			return nil
+		},
+	}
+
+	// Port 80 listener for automatic Let's Encrypt HTTP-01 verification & redirect
+	go func() {
+		httpRedir := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			targetHost := autoDomain
+			if targetHost == "" {
+				targetHost = r.Host
+			}
+			http.Redirect(w, r, "https://"+targetHost+":"+portStr+r.URL.RequestURI(), http.StatusMovedPermanently)
+		})
+		_ = http.ListenAndServe(":80", certManager.HTTPHandler(httpRedir))
+	}()
+
 	baseLn, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -168,19 +198,31 @@ func serveHTTPAndHTTPS(addr string, cert tls.Certificate, handler http.Handler) 
 	httpLnChan := &chanListener{addr: baseLn.Addr(), ch: make(chan net.Conn, 128)}
 
 	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"h2", "http/1.1", "acme-tls/1"},
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if hello.ServerName != "" && net.ParseIP(hello.ServerName) == nil {
+				if cert, err := certManager.GetCertificate(hello); err == nil {
+					return cert, nil
+				}
+			}
+			return &fallbackCert, nil
+		},
 	}
 	tlsListener := tls.NewListener(tlsLnChan, tlsConfig)
 
 	go http.Serve(tlsListener, handler)
 	go http.Serve(httpLnChan, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/ca.crt" {
-			handleCACert(w, r)
-			return
+		targetHost := r.Host
+		hostOnly, _, err := net.SplitHostPort(r.Host)
+		if err != nil {
+			hostOnly = r.Host
 		}
-		target := "https://" + r.Host + r.URL.RequestURI()
-		http.Redirect(w, r, target, http.StatusMovedPermanently)
+		// Redirect raw IP to sslip.io domain so browser gets a trusted Let's Encrypt certificate
+		if net.ParseIP(hostOnly) != nil && autoDomain != "" {
+			targetHost = autoDomain + ":" + portStr
+		}
+		http.Redirect(w, r, "https://"+targetHost+r.URL.RequestURI(), http.StatusMovedPermanently)
 	}))
 
 	for {
@@ -198,7 +240,7 @@ func serveHTTPAndHTTPS(addr string, cert tls.Certificate, handler http.Handler) 
 				return
 			}
 			pc := &peekConn{Conn: c, r: br}
-			if b[0] == 0x16 { // TLS Handshake byte
+			if b[0] == 0x16 {
 				tlsLnChan.ch <- pc
 			} else {
 				httpLnChan.ch <- pc
@@ -207,44 +249,8 @@ func serveHTTPAndHTTPS(addr string, cert tls.Certificate, handler http.Handler) 
 	}
 }
 
-func ensureTLSCert(hostIP string) (tls.Certificate, error) {
-	caFile := "webui_ca.crt"
-	certFile := "webui_server.crt"
-	keyFile := "webui_server.key"
-
-	if caData, err := os.ReadFile(caFile); err == nil {
-		if cert, err := tls.LoadX509KeyPair(certFile, keyFile); err == nil {
-			caCertPEM = caData
-			return cert, nil
-		}
-	}
-
-	// 1. Generate Root CA
-	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	caTmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(202601),
-		Subject: pkix.Name{
-			Organization: []string{"Xray Reality WebUI Root CA"},
-			CommonName:   "Xray Reality WebUI Root CA",
-		},
-		NotBefore:             time.Now().Add(-24 * time.Hour),
-		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	caCertPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
-	_ = os.WriteFile(caFile, caCertPEM, 0644)
-
-	// 2. Generate Server Certificate signed by Root CA
-	srvKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+func generateSelfSignedCert(hostIP string) (tls.Certificate, error) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
@@ -252,45 +258,23 @@ func ensureTLSCert(hostIP string) (tls.Certificate, error) {
 	if parsed := net.ParseIP(hostIP); parsed != nil {
 		ips = append(ips, parsed)
 	}
-	if outIP := net.ParseIP(detectOutboundIP()); outIP != nil {
-		ips = append(ips, outIP)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(202603),
+		Subject:      pkix.Name{CommonName: hostIP},
+		NotBefore:    time.Now().Add(-24 * time.Hour),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  ips,
 	}
-
-	srvTmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(202602),
-		Subject: pkix.Name{
-			Organization: []string{"Xray Reality WebUI"},
-			CommonName:   hostIP,
-		},
-		NotBefore:   time.Now().Add(-24 * time.Hour),
-		NotAfter:    time.Now().Add(820 * 24 * time.Hour),
-		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		IPAddresses: ips,
-		DNSNames:    []string{"localhost"},
-	}
-	if net.ParseIP(hostIP) == nil && hostIP != "" {
-		srvTmpl.DNSNames = append(srvTmpl.DNSNames, hostIP)
-	}
-
-	srvDER, err := x509.CreateCertificate(rand.Reader, srvTmpl, caTmpl, &srvKey.PublicKey, caKey)
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
-	srvCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srvDER})
-	srvKeyBytes, _ := x509.MarshalECPrivateKey(srvKey)
-	srvKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: srvKeyBytes})
-
-	_ = os.WriteFile(certFile, srvCertPEM, 0600)
-	_ = os.WriteFile(keyFile, srvKeyPEM, 0600)
-
-	return tls.X509KeyPair(srvCertPEM, srvKeyPEM)
-}
-
-func handleCACert(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/x-x509-ca-cert")
-	w.Header().Set("Content-Disposition", "attachment; filename=\"xray-webui-ca.crt\"")
-	w.Write(caCertPEM)
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyBytes, _ := x509.MarshalECPrivateKey(priv)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
+	return tls.X509KeyPair(certPEM, keyPEM)
 }
 
 func isTokenValid(provided string) bool {
@@ -722,12 +706,14 @@ const indexHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Xray Reality Core — Web UI</title>
 <style>
   :root {
     --navy-header: #0b1f32;
     --navy-dark: #061320;
+    --core-pill-bg: #0d2236;
+    --core-pill-border: rgba(56, 189, 248, 0.28);
     --royal-blue: #2e6ff2;
     --royal-hover: #1e5dd9;
     --card-white: #ffffff;
@@ -744,7 +730,8 @@ const indexHTML = `<!DOCTYPE html>
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", "Segoe UI", sans-serif;
     background-color: var(--card-white);
     color: var(--text-dark);
-    min-height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
     display: flex;
     justify-content: center;
     align-items: flex-start;
@@ -753,87 +740,87 @@ const indexHTML = `<!DOCTYPE html>
     width: 100%;
     max-width: 460px;
     background: var(--card-white);
-    min-height: 100vh;
+    height: 100dvh;
     display: flex;
     flex-direction: column;
+    justify-content: space-between;
   }
 
-  /* Honeycomb Mesh Header with X Logo */
+  /* Compact Honeycomb Mesh Header with X Logo */
   .navy-banner {
     position: relative;
     background-color: #081826;
     background-image:
       url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='56' height='98' viewBox='0 0 56 98'%3E%3Cg fill='none' stroke='%231d4968' stroke-width='1.3' stroke-opacity='0.55'%3E%3Cpath d='M28 66L0 50L0 16L28 0L56 16L56 50L28 66L28 100'/%3E%3Cpath d='M0 98L28 82L56 98'/%3E%3Cpath d='M28 0v-16'/%3E%3C/g%3E%3C/svg%3E"),
       radial-gradient(circle at 22% 45%, #154566 0%, #091d2e 55%, #05101a 100%);
-    background-size: 46px 80px, 100% 100%;
+    background-size: 42px 72px, 100% 100%;
     color: #ffffff;
-    padding: 18px 20px 18px;
+    padding: 11px 16px 11px;
     border-bottom: 1px solid #163852;
+    flex-shrink: 0;
   }
   .banner-top {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 14px;
+    margin-bottom: 8px;
   }
   .x-logo-wrap {
     display: flex;
     align-items: center;
   }
   .x-logo-svg {
-    width: 78px;
-    height: 44px;
-    filter: drop-shadow(0 2px 10px rgba(56, 189, 248, 0.35));
+    width: 66px;
+    height: 36px;
+    filter: drop-shadow(0 2px 8px rgba(56, 189, 248, 0.35));
   }
   .header-right {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
   }
   .status-badge {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    background: rgba(12, 33, 52, 0.75);
-    border: 1px solid rgba(56, 189, 248, 0.28);
-    padding: 5px 12px;
+    gap: 5px;
+    background: var(--core-pill-bg);
+    border: 1px solid var(--core-pill-border);
+    padding: 4px 10px;
     border-radius: 999px;
-    font-size: 11.5px;
+    font-size: 11px;
     font-weight: 600;
     color: #ffffff;
-    backdrop-filter: blur(4px);
   }
   .status-dot {
-    width: 7px;
-    height: 7px;
+    width: 6px;
+    height: 6px;
     border-radius: 50%;
     background: var(--green-ok);
-    box-shadow: 0 0 8px var(--green-ok);
+    box-shadow: 0 0 7px var(--green-ok);
   }
   .btn-lock {
     appearance: none;
     border: 1px solid rgba(255, 255, 255, 0.22);
-    background: rgba(12, 33, 52, 0.7);
+    background: var(--core-pill-bg);
     color: #ffffff;
-    font-size: 11px;
+    font-size: 10.5px;
     font-weight: 600;
-    padding: 5px 11px;
+    padding: 4px 10px;
     border-radius: 999px;
     cursor: pointer;
   }
-  .btn-lock:hover { background: rgba(255, 255, 255, 0.18); }
 
+  /* Core Version Bar */
   .banner-controls {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    background: rgba(9, 25, 40, 0.76);
-    border: 1px solid rgba(56, 189, 248, 0.22);
+    background: var(--core-pill-bg);
+    border: 1px solid var(--core-pill-border);
     border-radius: 999px;
-    padding: 6px 6px 6px 16px;
-    backdrop-filter: blur(6px);
+    padding: 4px 5px 4px 14px;
   }
-  .core-ver { font-size: 12.5px; color: rgba(255, 255, 255, 0.88); }
+  .core-ver { font-size: 12px; color: rgba(255, 255, 255, 0.9); }
   .core-ver b { color: #ffffff; font-family: ui-monospace, SFMono-Regular, monospace; font-weight: 700; }
   .hint-tag { color: var(--amber-star); font-weight: 600; margin-left: 4px; }
   .btn-pill-update {
@@ -841,83 +828,86 @@ const indexHTML = `<!DOCTYPE html>
     border: none;
     background: var(--royal-blue);
     color: #ffffff;
-    font-size: 12px;
+    font-size: 11.5px;
     font-weight: 600;
-    padding: 8px 16px;
+    padding: 6px 14px;
     border-radius: 999px;
     cursor: pointer;
-    transition: all 0.2s ease;
-    box-shadow: 0 4px 12px rgba(46, 111, 242, 0.4);
+    box-shadow: 0 3px 10px rgba(46, 111, 242, 0.35);
   }
-  .btn-pill-update:hover { background: var(--royal-hover); }
   .btn-pill-update.ready-upgrade {
     background: var(--amber-star);
     color: #112854;
-    box-shadow: 0 4px 12px rgba(245, 166, 35, 0.4);
   }
 
-  .content-body { padding: 20px 18px 24px; }
+  /* Compact Content Body for iPhone Air Single Screen */
+  .content-body {
+    padding: 10px 16px 12px;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
   .section-heading {
     display: flex;
     justify-content: center;
     align-items: center;
-    font-size: 15px;
+    font-size: 14px;
     font-weight: 700;
     color: var(--text-dark);
-    margin-bottom: 14px;
+    margin-bottom: 6px;
     text-align: center;
   }
 
-  .grid { display: grid; gap: 13px; }
-  .row-2 { display: grid; grid-template-columns: 2fr 1fr; gap: 10px; }
-  .row-equal { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .grid { display: grid; gap: 7px; }
+  .row-2 { display: grid; grid-template-columns: 2fr 1fr; gap: 8px; }
+  .row-equal { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   label {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    font-size: 11.5px;
+    font-size: 10.5px;
     color: var(--text-muted);
-    margin-bottom: 5px;
+    margin-bottom: 3px;
     font-weight: 600;
     padding: 0 2px;
   }
   .lock-tag {
-    font-size: 9.5px;
+    font-size: 8.5px;
     color: #64748b;
     background: #e2e8f0;
-    padding: 2px 7px;
+    padding: 1px 6px;
     border-radius: 999px;
     letter-spacing: 0.04em;
     display: none;
     font-weight: 700;
   }
   .lock-tag.visible { display: inline-block; }
+
   .proto-tabs {
     display: grid;
     grid-template-columns: repeat(3, 1fr);
-    gap: 8px;
+    gap: 6px;
     background: var(--surface-gray);
-    padding: 5px;
-    border-radius: 16px;
+    padding: 4px;
+    border-radius: 13px;
   }
   .proto-tab {
     appearance: none;
     background: transparent;
     border: none;
     color: var(--text-muted);
-    padding: 9px 0;
-    font-size: 12.5px;
+    padding: 6px 0;
+    font-size: 12px;
     font-weight: 700;
-    border-radius: 12px;
+    border-radius: 10px;
     cursor: pointer;
-    transition: all 0.18s ease;
     user-select: none;
   }
-  .proto-tab:hover { color: var(--text-dark); }
   .proto-tab.active {
     background: var(--royal-blue);
     color: #ffffff;
-    box-shadow: 0 4px 12px rgba(46, 111, 242, 0.35);
+    box-shadow: 0 3px 10px rgba(46, 111, 242, 0.3);
   }
 
   .select-wrap {
@@ -927,10 +917,10 @@ const indexHTML = `<!DOCTYPE html>
   .select-wrap::after {
     content: "▾";
     position: absolute;
-    right: 13px;
+    right: 11px;
     top: 50%;
     transform: translateY(-50%);
-    font-size: 12px;
+    font-size: 11px;
     color: #7b88a1;
     pointer-events: none;
   }
@@ -939,26 +929,25 @@ const indexHTML = `<!DOCTYPE html>
     -webkit-appearance: none;
     appearance: none;
     width: 100%;
+    height: 35px;
     background: var(--surface-gray);
     border: 1.5px solid transparent;
     color: var(--text-dark);
-    padding: 10px 13px;
-    border-radius: 14px;
-    font-size: 13.5px;
+    padding: 0 11px;
+    border-radius: 11px;
+    font-size: 12.5px;
     font-weight: 600;
     outline: none;
-    transition: all 0.18s ease;
   }
   select {
-    padding-right: 30px;
+    padding-right: 26px;
   }
   input:focus, select:focus {
     background: #ffffff;
     border-color: var(--royal-blue);
-    box-shadow: 0 3px 12px rgba(46, 111, 242, 0.12);
   }
 
-  /* Identical Locked ("Cemented") Styling for both <input> and <select> on iOS Safari */
+  /* Identical Locked ("Cemented") Styling for both <input> and <select> */
   input:disabled, select:disabled {
     -webkit-appearance: none !important;
     appearance: none !important;
@@ -976,60 +965,75 @@ const indexHTML = `<!DOCTYPE html>
     cursor: not-allowed;
   }
 
-  .actions { display: flex; gap: 10px; margin-top: 16px; }
+  /* 1. New Keys button width matches Port section (2fr 1fr grid) */
+  .actions {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 8px;
+    margin-top: 8px;
+  }
   button.main-btn {
     cursor: pointer;
     border: none;
     border-radius: 999px;
-    padding: 11px 18px;
-    font-size: 13px;
+    height: 37px;
+    padding: 0 12px;
+    font-size: 12.5px;
     font-weight: 700;
-    transition: all 0.2s ease;
+    width: 100%;
   }
   .btn-primary {
-    flex: 1;
     background: var(--royal-blue);
     color: #ffffff;
-    box-shadow: 0 6px 16px rgba(46, 111, 242, 0.3);
+    box-shadow: 0 4px 12px rgba(46, 111, 242, 0.28);
   }
-  .btn-primary:hover { background: var(--royal-hover); }
-  .btn-secondary { background: var(--surface-gray); color: var(--navy-header); }
-  .btn-secondary:hover { background: #e1e7f0; }
-  .link-card {
-    margin-top: 18px;
+  .btn-secondary {
     background: var(--surface-gray);
-    border-radius: 20px;
-    padding: 14px;
+    color: var(--navy-header);
+  }
+
+  /* Compact Share Link Box */
+  .link-card {
+    margin-top: 8px;
+    background: var(--surface-gray);
+    border-radius: 16px;
+    padding: 9px 11px;
   }
   .uri-field {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 11.5px;
+    font-size: 10.5px;
     word-break: break-all;
     background: #ffffff;
-    padding: 11px 13px;
-    border-radius: 12px;
+    padding: 7px 9px;
+    border-radius: 10px;
     color: var(--navy-header);
-    margin: 6px 0 10px;
-    max-height: 82px;
+    margin: 4px 0 7px;
+    height: 48px;
     overflow-y: auto;
-    line-height: 1.45;
+    line-height: 1.35;
     border: 1px solid var(--surface-border);
   }
-  .btn-copy { width: 100%; background: var(--navy-header); color: #ffffff; }
-  .btn-copy:hover { background: var(--navy-dark); }
+  /* 2. Copy Share Link button matches Core v26.10.10 capsule color */
+  .btn-copy {
+    width: 100%;
+    height: 35px;
+    background: var(--core-pill-bg);
+    border: 1px solid var(--core-pill-border);
+    color: #ffffff;
+  }
   .status-msg {
-    font-size: 11.5px;
+    font-size: 10.5px;
     color: var(--royal-blue);
-    margin-top: 10px;
-    min-height: 16px;
+    margin-top: 4px;
+    min-height: 13px;
     text-align: center;
     font-weight: 600;
   }
 
-  /* Full-Screen Centered Password Login View (No Top Header) */
+  /* Centered Login Screen */
   #loginView {
     flex: 1;
-    min-height: 100vh;
+    height: 100dvh;
     display: flex;
     flex-direction: column;
     justify-content: center;
@@ -1037,66 +1041,52 @@ const indexHTML = `<!DOCTYPE html>
   }
   .login-box {
     background: var(--surface-gray);
-    border-radius: 24px;
-    padding: 26px 20px 22px;
+    border-radius: 22px;
+    padding: 24px 18px 20px;
     text-align: center;
-    box-shadow: 0 12px 32px rgba(18, 31, 56, 0.06);
   }
   .login-title {
-    font-size: 17px;
+    font-size: 16px;
     font-weight: 700;
     color: var(--text-dark);
-    margin-bottom: 6px;
+    margin-bottom: 5px;
   }
   .login-sub {
-    font-size: 12.5px;
+    font-size: 12px;
     color: var(--text-muted);
-    margin-bottom: 18px;
+    margin-bottom: 16px;
     font-weight: 500;
   }
   #loginPass {
     background: #ffffff;
     text-align: center;
-    margin-bottom: 12px;
+    margin-bottom: 10px;
     border: 1.5px solid var(--surface-border);
   }
-  #loginPass:focus {
-    border-color: var(--royal-blue);
-  }
   .login-err {
-    font-size: 12px;
-    color: var(--red-err);
-    margin-top: 10px;
-    min-height: 16px;
-    font-weight: 600;
-  }
-  .ssl-link {
-    display: inline-block;
-    margin-top: 14px;
     font-size: 11.5px;
-    color: var(--text-muted);
-    text-decoration: none;
+    color: var(--red-err);
+    margin-top: 8px;
+    min-height: 15px;
     font-weight: 600;
   }
-  .ssl-link:hover { color: var(--royal-blue); }
   .hidden { display: none !important; }
 </style>
 </head>
 <body>
   <div class="screen-inner">
-    <!-- Centered Password Login Screen (Header Hidden) -->
+    <!-- Centered Password Login Screen -->
     <div id="loginView">
       <div class="login-box">
         <div class="login-title">Panel Login</div>
         <div class="login-sub">Enter your panel password to unlock</div>
         <input id="loginPass" type="password" placeholder="Password" autocomplete="current-password">
-        <button type="button" class="main-btn btn-primary" id="loginBtn" style="width:100%">Unlock Panel</button>
+        <button type="button" class="main-btn btn-primary" id="loginBtn">Unlock Panel</button>
         <div class="login-err" id="loginErr"></div>
-        <a class="ssl-link" href="/ca.crt">Install SSL Profile (Secured HTTPS)</a>
       </div>
     </div>
 
-    <!-- Top Honeycomb Banner with Cybernetic X Logo (Shown only after login) -->
+    <!-- Top Honeycomb Banner with Cybernetic X Logo -->
     <div class="navy-banner hidden" id="topBanner">
       <div class="banner-top">
         <div class="x-logo-wrap" title="Xray Core">
@@ -1108,7 +1098,6 @@ const indexHTML = `<!DOCTYPE html>
                 <stop offset="100%" stop-color="#94a8b8"/>
               </linearGradient>
             </defs>
-            <!-- Horizontal speed lines -->
             <g stroke="#7dd3fc" stroke-width="1" stroke-opacity="0.65">
               <line x1="12" y1="24" x2="138" y2="24"/>
               <line x1="6" y1="33" x2="144" y2="33"/>
@@ -1116,10 +1105,8 @@ const indexHTML = `<!DOCTYPE html>
               <line x1="8" y1="51" x2="142" y2="51"/>
               <line x1="18" y1="60" x2="132" y2="60"/>
             </g>
-            <!-- Upper and Lower Metallic X Chevrons -->
             <path d="M40 8 L58 8 L75 28 L92 8 L110 8 L83 39 L67 39 Z" fill="url(#xMetal)"/>
             <path d="M40 76 L58 76 L75 56 L92 76 L110 76 L83 45 L67 45 Z" fill="url(#xMetal)"/>
-            <!-- Glowing Cyan Pixel Particles -->
             <g fill="#38bdf8">
               <rect x="62" y="34" width="4" height="4"/>
               <rect x="70" y="38" width="5" height="5"/>
@@ -1135,8 +1122,6 @@ const indexHTML = `<!DOCTYPE html>
               <rect x="108" y="43" width="3.5" height="3.5"/>
               <rect x="50" y="49" width="3.5" height="3.5"/>
               <rect x="92" y="50" width="3.5" height="3.5"/>
-              <rect x="24" y="35" width="2.5" height="2.5" fill="#0ea5e9"/>
-              <rect x="118" y="36" width="2.5" height="2.5" fill="#0ea5e9"/>
             </g>
           </svg>
         </div>
@@ -1150,110 +1135,112 @@ const indexHTML = `<!DOCTYPE html>
       </div>
       <div class="banner-controls" id="bannerControls">
         <div class="core-ver">
-          Core: <b id="coreVersion">v26.1.18</b>
+          Core: <b id="coreVersion">v26.10.10</b>
           <span class="hint-tag" id="latestHint"></span>
         </div>
         <button type="button" class="btn-pill-update" id="updateBtn">Check Update</button>
       </div>
     </div>
 
-    <!-- Main Configuration Body (Hidden until unlocked) -->
+    <!-- Main Configuration Body -->
     <div class="content-body hidden" id="appView">
-      <div class="section-heading">
-        <span>Node Configuration</span>
-      </div>
-
-      <div class="grid">
-        <div>
-          <label><span>Profile Name (Remark)</span></label>
-          <input id="remark" type="text" value="Xray-RAW-Reality">
+      <div>
+        <div class="section-heading">
+          <span>Node Configuration</span>
         </div>
 
-        <div>
-          <label><span>Transport Protocol</span></label>
-          <div class="proto-tabs" id="protoTabs">
-            <button type="button" class="proto-tab active" data-proto="raw">RAW (TCP)</button>
-            <button type="button" class="proto-tab" data-proto="xhttp">XHTTP</button>
-            <button type="button" class="proto-tab" data-proto="grpc">gRPC</button>
+        <div class="grid">
+          <div>
+            <label><span>Profile Name (Remark)</span></label>
+            <input id="remark" type="text" value="Xray-RAW-Reality">
           </div>
-        </div>
 
-        <div class="row-2">
           <div>
-            <label><span>Server IP or Domain</span></label>
-            <input id="serverHost" type="text" value="203.0.113.10">
-          </div>
-          <div>
-            <label><span>Port</span></label>
-            <input id="port" type="number" value="443">
-          </div>
-        </div>
-
-        <div class="row-equal">
-          <div>
-            <label><span>SNI (Masking Domain)</span></label>
-            <input id="sni" type="text" value="www.microsoft.com">
-          </div>
-          <div>
-            <label><span>Fingerprint (uTLS)</span></label>
-            <div class="select-wrap">
-              <select id="fingerprint">
-                <option value="chrome" selected>Chrome (default)</option>
-                <option value="safari">Safari</option>
-                <option value="ios">iOS</option>
-                <option value="firefox">Firefox</option>
-                <option value="edge">Edge</option>
-                <option value="android">Android</option>
-                <option value="random">Random</option>
-                <option value="randomized">Randomized</option>
-              </select>
+            <label><span>Transport Protocol</span></label>
+            <div class="proto-tabs" id="protoTabs">
+              <button type="button" class="proto-tab active" data-proto="raw">RAW (TCP)</button>
+              <button type="button" class="proto-tab" data-proto="xhttp">XHTTP</button>
+              <button type="button" class="proto-tab" data-proto="grpc">gRPC</button>
             </div>
           </div>
-        </div>
 
-        <div class="row-equal">
+          <div class="row-2">
+            <div>
+              <label><span>Server IP or Domain</span></label>
+              <input id="serverHost" type="text" value="194.87.219.231">
+            </div>
+            <div>
+              <label><span>Port</span></label>
+              <input id="port" type="number" value="443">
+            </div>
+          </div>
+
+          <div class="row-equal">
+            <div>
+              <label><span>SNI (Masking Domain)</span></label>
+              <input id="sni" type="text" value="www.microsoft.com">
+            </div>
+            <div>
+              <label><span>Fingerprint (uTLS)</span></label>
+              <div class="select-wrap">
+                <select id="fingerprint">
+                  <option value="chrome" selected>Chrome (default)</option>
+                  <option value="safari">Safari</option>
+                  <option value="ios">iOS</option>
+                  <option value="firefox">Firefox</option>
+                  <option value="edge">Edge</option>
+                  <option value="android">Android</option>
+                  <option value="random">Random</option>
+                  <option value="randomized">Randomized</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div class="row-equal">
+            <div>
+              <label>
+                <span>Flow Control</span>
+                <span class="lock-tag" id="flowLock">LOCKED</span>
+              </label>
+              <div class="select-wrap">
+                <select id="flow">
+                  <option value="xtls-rprx-vision" selected>xtls-rprx-vision (default)</option>
+                  <option value="xtls-rprx-vision-udp443">xtls-rprx-vision-udp443</option>
+                </select>
+              </div>
+            </div>
+            <div>
+              <label>
+                <span id="modeLabel">Transport Mode</span>
+                <span class="lock-tag visible" id="modeLock">LOCKED</span>
+              </label>
+              <div class="select-wrap">
+                <select id="transportMode" disabled>
+                  <option value="">Locked for RAW</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
           <div>
             <label>
-              <span>Flow Control</span>
-              <span class="lock-tag" id="flowLock">LOCKED</span>
+              <span id="pathLabel">Path / ServiceName</span>
+              <span class="lock-tag visible" id="pathLock">LOCKED</span>
             </label>
-            <div class="select-wrap">
-              <select id="flow">
-                <option value="xtls-rprx-vision" selected>xtls-rprx-vision (default)</option>
-                <option value="xtls-rprx-vision-udp443">xtls-rprx-vision-udp443</option>
-              </select>
-            </div>
-          </div>
-          <div>
-            <label>
-              <span id="modeLabel">Transport Mode</span>
-              <span class="lock-tag visible" id="modeLock">LOCKED</span>
-            </label>
-            <div class="select-wrap">
-              <select id="transportMode" disabled>
-                <option value="">Locked for RAW</option>
-              </select>
-            </div>
+            <input id="transportPath" type="text" value="Locked for RAW" disabled>
           </div>
         </div>
 
-        <div>
-          <label>
-            <span id="pathLabel">Path / ServiceName</span>
-            <span class="lock-tag visible" id="pathLock">LOCKED</span>
-          </label>
-          <input id="transportPath" type="text" value="Locked for RAW" disabled>
+        <div class="actions">
+          <button type="button" class="main-btn btn-primary" id="applyBtn">Apply &amp; Get Link</button>
+          <button type="button" class="main-btn btn-secondary" id="rekeyBtn">New Keys</button>
         </div>
-      </div>
-
-      <div class="actions">
-        <button type="button" class="main-btn btn-primary" id="applyBtn">Apply &amp; Get Link</button>
-        <button type="button" class="main-btn btn-secondary" id="rekeyBtn">New Keys</button>
       </div>
 
       <div class="link-card">
         <label><span>Generated VLESS Share Link</span></label>
-        <div class="uri-field" id="shareLink">vless://9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d@203.0.113.10:443?encryption=none&amp;flow=xtls-rprx-vision&amp;fp=chrome&amp;pbk=mX9_kLp2vR8nQwZy4tH6jF1cB0gV5sA3dE7uI9oP2xM&amp;security=reality&amp;sid=a4f8c91e&amp;sni=www.microsoft.com&amp;type=tcp#Xray-RAW-Reality</div>
+        <div class="uri-field" id="shareLink">vless://da592fba-8c93-46b9-84b1-aa6db33b236d@194.87.219.231:443?encryption=none&amp;flow=xtls-rprx-vision&amp;fp=chrome&amp;pbk=mX9_kLp2vR8nQwZy4tH6jF1cB0gV5sA3dE7uI9oP2xM&amp;security=reality&amp;sid=a4f8c91e&amp;sni=www.microsoft.com&amp;type=tcp#Xray-RAW-Reality</div>
         <button type="button" class="main-btn btn-copy" id="copyBtn">Copy Share Link</button>
         <div class="status-msg" id="msg"></div>
       </div>
@@ -1317,9 +1304,9 @@ const indexHTML = `<!DOCTYPE html>
 
   let currentProto = "raw";
   let updateStage = "check";
-  let latestTag = "v26.2.4";
+  let latestTag = "v26.10.10";
   let creds = {
-    uuid: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+    uuid: "da592fba-8c93-46b9-84b1-aa6db33b236d",
     pbk: "mX9_kLp2vR8nQwZy4tH6jF1cB0gV5sA3dE7uI9oP2xM",
     sid: "a4f8c91e"
   };
